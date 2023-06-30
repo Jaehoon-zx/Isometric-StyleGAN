@@ -10,9 +10,37 @@
 
 import numpy as np
 import torch
+import torch.autograd.functional as F
+
 from torch_utils import training_stats
 from torch_utils.ops import conv2d_gradfix
 from torch_utils.ops import upfirdn2d
+
+"""
+relaxed_distortion_measure function from 
+https://github.com/Gabe-YHLee/IRVAE-public/blob/main/geometry.py
+"""
+#######################################################################################################################
+
+def relaxed_distortion_measure(func, z, eta=0.2, metric='identity', create_graph=True):
+    if metric == 'identity':
+        bs = len(z)
+        z_perm = z[torch.randperm(bs)]
+        if eta is not None:
+            alpha = (torch.rand(bs) * (1 + 2*eta) - eta).unsqueeze(1).to(z)
+            z_augmented = alpha*z + (1-alpha)*z_perm
+        else:
+            z_augmented = z
+        v = torch.randn((*z.size(),*z.size())).to(z)
+        Jv = torch.autograd.functional.jvp(func, z_augmented, v=v, create_graph=create_graph)[1]
+        TrG = torch.sum(Jv.view(bs, -1)**2, dim=1).mean()
+        JTJv = (torch.autograd.functional.vjp(func, z_augmented, v=Jv, create_graph=create_graph)[1]).view(bs, -1)
+        TrG2 = torch.sum(JTJv**2, dim=1).mean()
+        return TrG2/TrG**2
+    else:
+        raise NotImplementedError
+
+#######################################################################################################################
 
 #----------------------------------------------------------------------------
 
@@ -23,7 +51,7 @@ class Loss:
 #----------------------------------------------------------------------------
 
 class StyleGAN2Loss(Loss):
-    def __init__(self, device, G, D, augment_pipe=None, r1_gamma=10, style_mixing_prob=0, pl_weight=0, pl_batch_shrink=2, pl_decay=0.01, pl_no_weight_grad=False, blur_init_sigma=0, blur_fade_kimg=0):
+    def __init__(self, device, G, D, augment_pipe=None, r1_gamma=10, style_mixing_prob=0, pl_weight=2, pl_batch_shrink=2, pl_decay=0.01, pl_no_weight_grad=False, blur_init_sigma=0, blur_fade_kimg=0):
         super().__init__()
         self.device             = device
         self.G                  = G
@@ -48,6 +76,16 @@ class StyleGAN2Loss(Loss):
                 ws[:, cutoff:] = self.G.mapping(torch.randn_like(z), c, update_emas=False)[:, cutoff:]
         img = self.G.synthesis(ws, update_emas=update_emas)
         return img, ws
+
+    def run_G_wo(self, z, c, update_emas=False):
+        ws = self.G.mapping(z, c, update_emas=update_emas)
+        if self.style_mixing_prob > 0:
+            with torch.autograd.profiler.record_function('style_mixing'):
+                cutoff = torch.empty([], dtype=torch.int64, device=ws.device).random_(1, ws.shape[1])
+                cutoff = torch.where(torch.rand([], device=ws.device) < self.style_mixing_prob, cutoff, torch.full_like(cutoff, ws.shape[1]))
+                ws[:, cutoff:] = self.G.mapping(torch.randn_like(z), c, update_emas=False)[:, cutoff:]
+        img = self.G.synthesis(ws, update_emas=update_emas)
+        return img
 
     def run_D(self, img, c, blur_sigma=0, update_emas=False):
         blur_size = np.floor(blur_sigma * 3)
@@ -84,17 +122,55 @@ class StyleGAN2Loss(Loss):
         if phase in ['Greg', 'Gboth']:
             with torch.autograd.profiler.record_function('Gpl_forward'):
                 batch_size = gen_z.shape[0] // self.pl_batch_shrink
+
+                #######################################################################################################################
+                """Perceptual Path Length penalty"""
+
+                # gen_img, gen_ws = self.run_G(gen_z[:batch_size], gen_c[:batch_size]) # (8, 3, 256, 256) (8, 16, 512)
+                # pl_noise = torch.randn_like(gen_img) / np.sqrt(gen_img.shape[2] * gen_img.shape[3])
+                # with torch.autograd.profiler.record_function('pl_grads'), conv2d_gradfix.no_weight_gradients(self.pl_no_weight_grad):
+                #     pl_grads = torch.autograd.grad(outputs=[(gen_img * pl_noise).sum()], inputs=[gen_ws], create_graph=True, only_inputs=True)[0]
+
+                # pl_lengths = pl_grads.square().sum(2).mean(1).sqrt()
+                # pl_mean = self.pl_mean.lerp(pl_lengths.mean(), self.pl_decay)
+                # self.pl_mean.copy_(pl_mean.detach())
+                # pl_penalty = (pl_lengths - pl_mean).square()
+
+                #######################################################################################################################
+                """Distortion Measure penalty"""
+
+                # v = torch.randn_like(gen_z[:batch_size]) / gen_z.shape[1]
+                # c =  torch.randn_like(gen_c[:batch_size])
+
+                # Jv = F.jvp(self.run_G_wo, (gen_z[:batch_size], gen_c[:batch_size]), (v,c), create_graph=True)[1]  # (8, 3, 512, 512) 
+                # JTJv = F.vjp(self.run_G_wo, (gen_z[:batch_size], gen_c[:batch_size]), Jv, create_graph=True)[1][0] # (8, 512)
+
+                # TrG2 = torch.sum(JTJv.view(batch_size, -1) ** 2, dim=1).mean()
+                # TrG = torch.sum(Jv.view(batch_size, -1) ** 2, dim=1).mean()
+
+                # pl_penalty = TrG2 / TrG ** 2
+                
+                #######################################################################################################################
+                """Distortion Measure penalty at W space"""
+
                 gen_img, gen_ws = self.run_G(gen_z[:batch_size], gen_c[:batch_size])
-                pl_noise = torch.randn_like(gen_img) / np.sqrt(gen_img.shape[2] * gen_img.shape[3])
-                with torch.autograd.profiler.record_function('pl_grads'), conv2d_gradfix.no_weight_gradients(self.pl_no_weight_grad):
-                    pl_grads = torch.autograd.grad(outputs=[(gen_img * pl_noise).sum()], inputs=[gen_ws], create_graph=True, only_inputs=True)[0]
-                pl_lengths = pl_grads.square().sum(2).mean(1).sqrt()
-                pl_mean = self.pl_mean.lerp(pl_lengths.mean(), self.pl_decay)
-                self.pl_mean.copy_(pl_mean.detach())
-                pl_penalty = (pl_lengths - pl_mean).square()
-                training_stats.report('Loss/pl_penalty', pl_penalty)
+                v = torch.randn_like(gen_ws) / np.sqrt(gen_ws.shape[1] * gen_ws.shape[2]) # (8, 16, 512)
+
+                Jv = F.jvp(self.G.synthesis, gen_ws, v, create_graph=True)[1]  # (8, 3, 512, 512) 
+                JTJv = F.vjp(self.G.synthesis, gen_ws, Jv, create_graph=True)[1] # (8, 512)
+
+                TrG2 = torch.sum(JTJv.view(batch_size, -1) ** 2, dim=1).mean()
+                TrG = torch.sum(Jv.view(batch_size, -1) ** 2, dim=1).mean()
+
+                pl_penalty = TrG2 / TrG ** 2
+
+                print(TrG2, TrG, pl_penalty)
+
+                #######################################################################################################################
                 loss_Gpl = pl_penalty * self.pl_weight
+                training_stats.report('Loss/pl_penalty', pl_penalty)
                 training_stats.report('Loss/G/reg', loss_Gpl)
+                
             with torch.autograd.profiler.record_function('Gpl_backward'):
                 loss_Gpl.mean().mul(gain).backward()
 

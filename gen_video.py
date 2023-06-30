@@ -60,6 +60,7 @@ def gen_interp_video(G, mp4: str, seeds, shuffle_seed=None, w_frames=60*4, kind=
         rng = np.random.RandomState(seed=shuffle_seed)
         rng.shuffle(all_seeds)
 
+    device = torch.device('cuda') if torch.cuda.is_available() else torch.device('cpu')
     zs = torch.from_numpy(np.stack([np.random.RandomState(seed).randn(G.z_dim) for seed in all_seeds])).to(device)
     ws = G.mapping(z=zs, c=None, truncation_psi=psi)
     _ = G.synthesis(ws[:1]) # warm up
@@ -166,7 +167,7 @@ def generate_images(
     """
 
     print('Loading networks from "%s"...' % network_pkl)
-    device = torch.device('cuda')
+    device = torch.device('cuda') if torch.cuda.is_available() else torch.device('cpu')
     with dnnlib.util.open_url(network_pkl) as f:
         G = legacy.load_network_pkl(f)['G_ema'].to(device) # type: ignore
 
